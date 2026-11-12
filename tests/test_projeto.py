@@ -63,8 +63,39 @@ def test_makefile_com_alvo_test(tmp_path):
 
 def test_sem_nada_avisa(tmp_path):
     d = projeto.detectar(_repo(tmp_path, remoto=None))
-    assert d.cmd_testes is None and d.github is None
+    assert d.partes == [] and d.github is None
     assert len(d.avisos) == 2
+    assert "gh repo create" in d.avisos[0]
+
+
+def test_venv_usa_python_do_venv(tmp_path):
+    (tmp_path / "pyproject.toml").write_text('[project]\nname="x"\n')
+    (tmp_path / "tests").mkdir()
+    (tmp_path / ".venv" / "Scripts").mkdir(parents=True)
+    assert projeto.detectar_comandos(tmp_path) == (".venv/Scripts/python -m pytest -q", None)
+
+
+def test_projeto_em_partes_como_a_poc(tmp_path):
+    raiz = _repo(tmp_path / "poc", remoto=None)
+    (raiz / "agent" / "tests").mkdir(parents=True)
+    (raiz / "agent" / "pyproject.toml").write_text('[project]\nname="poc-agent"\n')
+    (raiz / "agent" / ".venv" / "Scripts").mkdir(parents=True)
+    (raiz / "bff").mkdir()
+    (raiz / "bff" / "pyproject.toml").write_text('[project]\nname="poc-bff"\n')
+    (raiz / "web").mkdir()
+    (raiz / "web" / "package.json").write_text('{"scripts": {"dev": "next dev", "lint": "eslint"}}')
+    (raiz / "web" / "node_modules").mkdir()
+    (raiz / "exemplos").mkdir()
+
+    d = projeto.detectar(raiz)
+    assert d.partes == [
+        projeto.Parte("agent", ".venv/Scripts/python -m pytest -q", None),
+        projeto.Parte("bff", None, None),
+        projeto.Parte("web", None, "npm run lint"),
+    ]
+    assert not any("testes" in a for a in d.avisos)
+    dados = tomllib.loads(projeto.gerar_config(d))
+    assert [p["pasta"] for p in dados["partes"]] == ["agent", "bff", "web"]
 
 
 def test_fora_de_repositorio(tmp_path):
@@ -72,10 +103,12 @@ def test_fora_de_repositorio(tmp_path):
 
 
 def test_config_gerado_e_toml_valido(tmp_path):
-    d = projeto.Deteccao(raiz=tmp_path, nome='app "x"', branch_principal="main", cmd_testes="pytest -q")
+    d = projeto.Deteccao(
+        raiz=tmp_path, nome='app "x"', branch_principal="main", partes=[projeto.Parte(".", "pytest -q")]
+    )
     dados = tomllib.loads(projeto.gerar_config(d))
     assert dados["projeto"]["nome"] == 'app "x"'
-    assert dados["comandos"]["testes"] == "pytest -q"
+    assert dados["partes"] == [{"pasta": ".", "testes": "pytest -q", "lint": ""}]
     assert dados["quota"]["teto_semanal"] == 0.6
 
 

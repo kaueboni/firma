@@ -70,9 +70,12 @@ def init(
     typer.echo(f"Projeto: {d.nome}  ({d.raiz})")
     typer.echo(f"  branch principal: {d.branch_principal}")
     typer.echo(f"  GitHub:           {d.github or '—'}")
-    typer.echo(f"  testes:           {d.cmd_testes or '—'}")
-    typer.echo(f"  lint:             {d.cmd_lint or '—'}")
     typer.echo(f"  CLAUDE.md:        {'sim' if d.tem_claude_md else 'não'}")
+    if not d.partes:
+        typer.echo("  partes:           nenhuma reconhecida")
+    for p in d.partes:
+        rotulo = "raiz" if p.pasta == "." else f"{p.pasta}/"
+        typer.echo(f"  [{rotulo}] testes: {p.testes or '—'}   lint: {p.lint or '—'}")
     for aviso in d.avisos:
         typer.echo(f" ! {aviso}")
     typer.echo("\nVai criar .firma/ (config.toml, backlog/, INBOX.md), pôr .firma/ no .gitignore e registrar o projeto.")

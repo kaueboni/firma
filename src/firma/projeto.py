@@ -18,14 +18,26 @@ PASTA = ".firma"
 INBOX_INICIAL = "# INBOX da Firma\n\nPerguntas que a Firma não pôde decidir sozinha aparecem aqui.\n"
 
 
+IGNORAR = {"node_modules", "dist", "build", "vendor", "target", "venv", "env", "__pycache__"}
+MARCADORES = ("pyproject.toml", "package.json", "go.mod", "Cargo.toml", "Makefile", "setup.py")
+
+
+@dataclass
+class Parte:
+    """Um pedaço do projeto com comandos próprios: a raiz (".") ou uma subpasta (ex.: "web")."""
+
+    pasta: str
+    testes: str | None = None
+    lint: str | None = None
+
+
 @dataclass
 class Deteccao:
     raiz: Path
     nome: str
     branch_principal: str
     github: str | None = None  # "dono/repo"
-    cmd_testes: str | None = None
-    cmd_lint: str | None = None
+    partes: list[Parte] = field(default_factory=list)
     tem_claude_md: bool = False
     avisos: list[str] = field(default_factory=list)
 
@@ -84,15 +96,31 @@ def _gerenciador_node(raiz: Path) -> str:
     return "npm"
 
 
+def _python(raiz: Path) -> tuple[str, str]:
+    """Como chamar pytest e ruff nesta pasta: (prefixo para ferramenta, prefixo para módulo).
+
+    Com uv.lock: `uv run`. Com um .venv: o Python do venv (Scripts no Windows, bin no resto),
+    para não depender de o ambiente estar ativado. Senão, os comandos direto.
+    """
+    if (raiz / "uv.lock").exists():
+        return "uv run ", "uv run "
+    for venv in (".venv", "venv"):
+        for sub in ("Scripts", "bin"):
+            if (raiz / venv / sub).is_dir():
+                py = f"{venv}/{sub}/python"
+                return f"{py} -m ", f"{py} -m "
+    return "", ""
+
+
 def detectar_comandos(raiz: Path) -> tuple[str | None, str | None]:
-    """Devolve (comando de testes, comando de lint) a partir dos arquivos do projeto."""
+    """Devolve (comando de testes, comando de lint) a partir dos arquivos de uma pasta."""
     testes = lint = None
+    prefixo, _ = _python(raiz)
 
     pyproject = raiz / "pyproject.toml"
     if pyproject.exists():
         dados = _ler_toml(pyproject)
         texto = pyproject.read_text(encoding="utf-8", errors="ignore")
-        prefixo = "uv run " if (raiz / "uv.lock").exists() else ""
         if "pytest" in texto or (raiz / "tests").is_dir() or (raiz / "pytest.ini").exists():
             testes = f"{prefixo}pytest -q"
         if "ruff" in dados.get("tool", {}) or "ruff" in texto or (raiz / "ruff.toml").exists():
@@ -103,11 +131,11 @@ def detectar_comandos(raiz: Path) -> tuple[str | None, str | None]:
         )
         marcadores_py = ("pytest.ini", "setup.py", "setup.cfg", "tox.ini")
         if "pytest" in reqs or any((raiz / m).exists() for m in marcadores_py):
-            testes = "pytest -q"
+            testes = f"{prefixo}pytest -q"
         elif reqs and (raiz / "tests").is_dir():
-            testes = "pytest -q"
+            testes = f"{prefixo}pytest -q"
         if "ruff" in reqs or (raiz / "ruff.toml").exists():
-            lint = "ruff check ."
+            lint = f"{prefixo}ruff check ."
 
     pacote = raiz / "package.json"
     if pacote.exists():
@@ -129,23 +157,41 @@ def detectar_comandos(raiz: Path) -> tuple[str | None, str | None]:
     return testes, lint
 
 
+def detectar_partes(raiz: Path) -> list[Parte]:
+    """A raiz e cada subpasta de primeiro nível que é um projeto (pyproject, package.json...)."""
+    partes: list[Parte] = []
+    candidatas = [raiz] + sorted(
+        p for p in raiz.iterdir() if p.is_dir() and not p.name.startswith(".") and p.name not in IGNORAR
+    )
+    for pasta in candidatas:
+        e_projeto = any((pasta / m).exists() for m in MARCADORES) or any(pasta.glob("requirements*.txt"))
+        if not e_projeto:
+            continue
+        testes, lint = detectar_comandos(pasta)
+        nome = "." if pasta == raiz else pasta.name
+        if testes or lint or nome != ".":
+            partes.append(Parte(nome, testes, lint))
+    return partes
+
+
 def detectar(pasta: Path) -> Deteccao | None:
     raiz = raiz_git(pasta)
     if raiz is None:
         return None
-    testes, lint = detectar_comandos(raiz)
     d = Deteccao(
         raiz=raiz,
         nome=raiz.name,
         branch_principal=detectar_branch_principal(raiz),
         github=parse_github(_git(raiz, "remote", "get-url", "origin")),
-        cmd_testes=testes,
-        cmd_lint=lint,
+        partes=detectar_partes(raiz),
         tem_claude_md=(raiz / "CLAUDE.md").exists() or (raiz / ".claude" / "CLAUDE.md").exists(),
     )
     if d.github is None:
-        d.avisos.append("Sem remoto do GitHub em `origin`: a Firma não vai conseguir abrir PRs.")
-    if d.cmd_testes is None:
+        d.avisos.append(
+            "Sem remoto do GitHub em `origin`: a Firma não vai conseguir abrir PRs. "
+            "Para criar um: gh repo create --private --source . --remote origin --push"
+        )
+    if not any(p.testes for p in d.partes):
         d.avisos.append("Nenhum comando de testes encontrado: preencha `testes` no config.toml.")
     return d
 
@@ -156,6 +202,22 @@ def _toml_str(valor: str | None) -> str:
     return '"' + valor.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def _partes_toml(partes: list[Parte]) -> str:
+    if not partes:
+        partes = [Parte(".")]
+    blocos = [
+        "\n# Uma [[partes]] por pedaço do projeto; os comandos rodam dentro de `pasta`.\n"
+    ]
+    for p in partes:
+        blocos.append(
+            "[[partes]]\n"
+            f"pasta = {_toml_str(p.pasta)}\n"
+            f"testes = {_toml_str(p.testes)}\n"
+            f"lint = {_toml_str(p.lint)}\n"
+        )
+    return "\n".join(blocos)
+
+
 def gerar_config(d: Deteccao) -> str:
     return (
         "# Configuração da Firma para este projeto. Gerado por `firma init`; pode editar.\n"
@@ -163,9 +225,7 @@ def gerar_config(d: Deteccao) -> str:
         f"nome = {_toml_str(d.nome)}\n"
         f"branch_principal = {_toml_str(d.branch_principal)}\n"
         f"github = {_toml_str(d.github)}\n"
-        "\n[comandos]\n"
-        f"testes = {_toml_str(d.cmd_testes)}\n"
-        f"lint = {_toml_str(d.cmd_lint)}\n"
+        f"{_partes_toml(d.partes)}"
         "\n[quota]\n"
         "# A Firma para quando a utilização semanal da conta chega a este teto (0 a 1).\n"
         "teto_semanal = 0.6\n"

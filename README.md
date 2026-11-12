@@ -31,7 +31,7 @@ firma init              # dentro de um repositório: detecta, mostra, confirma e
 firma projetos          # lista os projetos registrados nesta máquina
 ```
 
-`firma init` detecta a branch principal, o repositório no GitHub e os comandos de testes e lint (Python, Node, Go, Rust ou Makefile). Depois cria `.firma/` com `config.toml`, `backlog/` e `INBOX.md`, acrescenta `.firma/` ao `.gitignore` e registra o projeto em `~/.firma/projetos.json`. Não altera o código, o `CLAUDE.md` nem `.claude/`. O registro é único por máquina porque a quota é da conta: a Firma divide o mesmo orçamento entre todos os projetos.
+`firma init` detecta a branch principal, o repositório no GitHub e os comandos de testes e lint (Python, Node, Go, Rust ou Makefile), na raiz e em cada subpasta que seja um projeto (ex.: `agent/`, `web/`). Depois cria `.firma/` com `config.toml`, `backlog/` e `INBOX.md`, acrescenta `.firma/` ao `.gitignore` e registra o projeto em `~/.firma/projetos.json`. Não altera o código, o `CLAUDE.md` nem `.claude/`. O registro é único por máquina porque a quota é da conta: a Firma divide o mesmo orçamento entre todos os projetos.
 
 `firma doctor` falha se encontrar `ANTHROPIC_API_KEY` no ambiente: com ela, o Claude Code cobra por token em vez de usar a assinatura.
 
