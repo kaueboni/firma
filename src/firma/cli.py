@@ -2,10 +2,20 @@
 
 from __future__ import annotations
 
+import sys
+
 import anyio
 import typer
 
 from firma import __version__
+
+# No Windows, quando a saída vai para um pipe (como no shell do Claude Code), o Python usa cp1252
+# e quebra ao imprimir "✓". Forçamos UTF-8 e trocamos o que não couber em vez de falhar.
+for _fluxo in (sys.stdout, sys.stderr):
+    try:
+        _fluxo.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 from firma.doctor import AVISO, FALHA, OK, rodar_checagens
 
 app = typer.Typer(help="Firma: PRDs entram, PRs saem.", no_args_is_help=True, add_completion=False)
@@ -92,6 +102,7 @@ def init(
         typer.echo(" ✓ .firma/ acrescentada ao .gitignore (lembre de commitar essa linha)")
     typer.echo(" ✓ projeto registrado" if novo else " ✓ projeto já estava registrado")
     typer.echo(f"\nRevise {base / 'config.toml'} se algum comando estiver errado.")
+    typer.echo("Próximo passo: `firma claude instalar` (uma vez por máquina) e `/prd <ideia>` no Claude Code.")
 
 
 @app.command()
@@ -119,3 +130,126 @@ def _sondar_quota() -> None:
     for linha in veredito:
         typer.echo(f" → {linha}")
     typer.echo(f"\nResposta completa salva em {salvar(sonda)}")
+
+
+# ---------------------------------------------------------------- firma prd
+
+prd_app = typer.Typer(help="PRDs: criar, conferir e pôr na fila.", no_args_is_help=True)
+app.add_typer(prd_app, name="prd")
+
+
+def _backlog():
+    from pathlib import Path
+
+    from firma import projeto
+
+    raiz = projeto.raiz_git(Path.cwd())
+    base = raiz / projeto.PASTA if raiz else None
+    if base is None or not (base / "config.toml").exists():
+        typer.echo("A Firma não está configurada neste projeto. Rode `firma init` na raiz do repositório.")
+        raise typer.Exit(1)
+    return base / "backlog"
+
+
+def _abrir(alvo: str):
+    from firma import prd
+
+    backlog = _backlog()
+    caminho = prd.encontrar(backlog, alvo)
+    if caminho is None:
+        typer.echo(f"PRD não encontrado: {alvo}")
+        raise typer.Exit(1)
+    try:
+        return backlog, caminho, prd.ler(caminho)
+    except ValueError as e:
+        typer.echo(f"{caminho.name}: {e}")
+        raise typer.Exit(1)
+
+
+def _mostrar_resultado(r) -> None:
+    for e in r.erros:
+        typer.echo(f" ✗ {e}")
+    for a in r.avisos:
+        typer.echo(f" ! {a}")
+
+
+@prd_app.command("novo")
+def prd_novo(
+    titulo: str = typer.Argument(..., help="Título curto do PRD."),
+    tipo: str = typer.Option("feature", "--tipo", "-t", help="feature, bug ou refatoracao."),
+) -> None:
+    """Cria um PRD no backlog a partir do modelo do tipo escolhido."""
+    from firma import prd
+
+    if tipo not in prd.TIPOS:
+        typer.echo(f"Tipo inválido: {tipo}. Use {', '.join(prd.TIPOS)}.")
+        raise typer.Exit(1)
+    caminho = prd.criar(_backlog(), titulo, tipo)
+    typer.echo(f"Criado: {caminho}")
+    typer.echo("Preencha as seções com [PREENCHER] (ou use /prd no Claude Code) e rode `firma prd checar`.")
+
+
+@prd_app.command("listar")
+def prd_listar() -> None:
+    """Lista os PRDs do backlog com tipo, status e tamanho."""
+    from firma import prd
+
+    prds = prd.listar(_backlog())
+    if not prds:
+        typer.echo("Backlog vazio. Crie um PRD com `firma prd novo` ou `/prd` no Claude Code.")
+        return
+    for p in prds:
+        typer.echo(f" {p.id:8} {p.status:12} {p.tipo:12} {str(p.meta.get('tamanho', '?')):2} {p.titulo}")
+
+
+@prd_app.command("checar")
+def prd_checar(alvo: str = typer.Argument(..., help="Id (PRD-001 ou 1) ou caminho do arquivo.")) -> None:
+    """Confere a regra de pronto sem mudar nada."""
+    from firma import prd
+
+    backlog, caminho, p = _abrir(alvo)
+    r = prd.checar(p, {x.id for x in prd.listar(backlog)})
+    _mostrar_resultado(r)
+    if r.pronto:
+        typer.echo(f" ✓ {p.id} passa na regra de pronto. Para pôr na fila: firma prd pronto {p.id}")
+    else:
+        raise typer.Exit(1)
+
+
+@prd_app.command("pronto")
+def prd_pronto(alvo: str = typer.Argument(..., help="Id (PRD-001 ou 1) ou caminho do arquivo.")) -> None:
+    """Confere a regra de pronto e, se passar, muda o status para `pronto` (entra na fila)."""
+    from firma import prd
+
+    backlog, caminho, p = _abrir(alvo)
+    r = prd.checar(p, {x.id for x in prd.listar(backlog)})
+    _mostrar_resultado(r)
+    if not r.pronto:
+        typer.echo(f"\n{p.id} continua em {p.status}: corrija os erros acima.")
+        raise typer.Exit(1)
+    if p.status not in ("rascunho", "pronto"):
+        typer.echo(f"{p.id} está em {p.status}; só PRDs em rascunho entram na fila.")
+        raise typer.Exit(1)
+    prd.mudar_status(caminho, "pronto")
+    typer.echo(f" ✓ {p.id} está pronto e entra na fila.")
+
+
+# ---------------------------------------------------------------- firma claude
+
+claude_app = typer.Typer(help="Integração com o Claude Code.", no_args_is_help=True)
+app.add_typer(claude_app, name="claude")
+
+
+@claude_app.command("instalar")
+def claude_instalar(
+    forcar: bool = typer.Option(False, "--forcar", help="Sobrescreve comandos que você editou."),
+) -> None:
+    """Instala os comandos da Firma (/prd) no Claude Code, para todos os projetos."""
+    from firma import claude
+
+    for nome, situacao in claude.instalar(forcar):
+        if situacao == "editado":
+            typer.echo(f" ! /{nome}: você editou este comando; use --forcar para substituir")
+        else:
+            typer.echo(f" ✓ /{nome}: {situacao}")
+    typer.echo(f"Pasta: {claude.pasta_comandos()}")
