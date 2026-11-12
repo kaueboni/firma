@@ -106,7 +106,10 @@ def resumir(sonda: Sonda) -> tuple[list[str], list[str]]:
 
 
 def salvar(sonda: Sonda, pasta: Path | None = None) -> Path:
-    pasta = pasta or Path.home() / ".firma" / "sondas"
+    if pasta is None:
+        from firma.registro import home_firma
+
+        pasta = home_firma() / "sondas"
     pasta.mkdir(parents=True, exist_ok=True)
     caminho = pasta / f"quota-{time.strftime('%Y%m%d-%H%M%S')}.json"
     caminho.write_text(json.dumps(asdict(sonda), ensure_ascii=False, indent=2), encoding="utf-8")
