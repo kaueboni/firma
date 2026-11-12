@@ -193,3 +193,33 @@ def test_worktree_usa_os_ambientes_do_repositorio(projeto):
     # mesmo sem .gitignore para eles, os ambientes ligados não contam como mudança nem entram em commit
     assert not gitops.tem_mudancas(wt)
     assert gitops.commit(wt, "nada") is None
+
+
+def test_erro_inesperado_estaciona_e_conta(projeto):
+    class Quebra(Roteiro):
+        async def __call__(self, pedido, quota):
+            if pedido.papel == "developer":
+                raise ValueError("falha estranha do SDK")
+            return await super().__call__(pedido, quota)
+
+    resumo, eventos = _rodar(Quebra())
+    assert resumo["estacionado"] == ["app/PRD-001"]
+    assert any("ValueError" in e for e in eventos)
+    assert "ValueError" in (projeto / ".firma" / "INBOX.md").read_text()
+    assert executor.trava_ativa() is None
+
+
+def test_caminho_curto_e_feed():
+    from firma.sessao import _Feed, caminho_curto
+
+    wt = Path("C:/projetos/poc/.firma/worktrees/PRD-001")
+    assert caminho_curto("C:\\projetos\\poc\\.firma\\worktrees\\PRD-001\\agent\\app.py", wt) == "agent/app.py"
+    assert caminho_curto("C:\\projetos\\poc\\agent\\.venv\\Lib\\site-packages\\ag_ui_strands\\agent.py", wt) == "[lib] ag_ui_strands/agent.py"
+    assert caminho_curto("C:\\projetos\\poc\\README.md", wt) == "README.md"
+    assert caminho_curto("C:\\projetos\\poc", wt) == "."
+    linhas = []
+    feed = _Feed(lambda t, **k: linhas.append(t), "PRD-001", "dev")
+    for t in ["Read a", "Read a", "Read a", "Read b"]:
+        feed(t)
+    feed.fechar()
+    assert linhas == ["Read a", "  ↳ mais 2 vez(es)", "Read b"]

@@ -280,9 +280,18 @@ def run(
 
     try:
         resumo = anyio.run(principal_async)
-    except RuntimeError as e:
-        typer.echo(str(e))
+    except KeyboardInterrupt:
+        typer.echo("\nInterrompido. O PRD em andamento volta para a fila e retoma de onde parou.")
+        raise typer.Exit(130)
+    except Exception as e:
+        import traceback
+
+        registro(f"erro: {type(e).__name__}: {e}", traceback=traceback.format_exc())
+        typer.echo(f"\nErro: {type(e).__name__}: {e or '(sem mensagem)'}")
+        typer.echo(traceback.format_exc())
         raise typer.Exit(1)
+    if resumo.get("erro"):
+        typer.echo(f"\nErro no turno: {resumo['erro']} (detalhe em `firma status` e em ~/.firma/logs)")
     if resumo.get("pr-aberto"):
         typer.echo("\nPRs para revisar: " + ", ".join(resumo["pr-aberto"]))
     if resumo.get("estacionado"):

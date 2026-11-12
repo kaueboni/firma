@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -343,13 +344,31 @@ class Turno:
             log(f"pausado: {e}")
             raise
         except (Estacionar, gitops.ErroGit) as e:
+            return self._estacionar(p, caminho_prd, estado, wt, usar_pr, lista, str(e), log)
+        except Exception as e:  # erro inesperado: não derruba o turno, estaciona com o detalhe
+            detalhe = traceback.format_exc()
+            self.registro(f"erro inesperado: {type(e).__name__}: {e}", prd=p.id, papel="firma", traceback=detalhe)
+            return self._estacionar(
+                p, caminho_prd, estado, wt, usar_pr, lista,
+                f"Erro inesperado na Firma ({type(e).__name__}: {e}). Detalhe no log de ~/.firma/logs.", log,
+            )
+        except BaseException as e:  # Ctrl+C ou cancelamento: devolve o PRD para a fila e sai
             estado.salvar(self.raiz, p.id)
-            prdmod.mudar_status(caminho_prd, "estacionado")
-            _inbox(self.raiz, p.id, str(e))
-            if usar_pr and estado.pr:
-                gitops.atualizar_pr(wt, estado.pr, self._corpo_pr(p, estado, lista, f"Estacionado: {e}"))
-            log(f"estacionado: {e}")
-            return "estacionado"
+            prdmod.mudar_status(caminho_prd, "pronto")
+            log(f"interrompido ({type(e).__name__}): o PRD volta para a fila")
+            raise
+
+    def _estacionar(self, p, caminho_prd, estado, wt, usar_pr, lista, motivo, log) -> str:
+        estado.salvar(self.raiz, p.id)
+        prdmod.mudar_status(caminho_prd, "estacionado")
+        _inbox(self.raiz, p.id, motivo)
+        if usar_pr and estado.pr:
+            try:
+                gitops.atualizar_pr(wt, estado.pr, self._corpo_pr(p, estado, lista, f"Estacionado: {motivo}"))
+            except Exception:
+                pass
+        log(f"estacionado: {motivo}")
+        return "estacionado"
 
     async def _fazer_tarefa(self, p, wt: Path, docs: str, tarefa, estado: EstadoPrd) -> None:
         rodadas = int(self.cfg["execucao"].get("rodadas", 3))
@@ -505,11 +524,16 @@ async def rodar_turno(
     except Pausa as e:
         resumo["pausa"] = str(e)
         return resumo
+    except Exception as e:
+        resumo["erro"] = f"{type(e).__name__}: {e}"
+        registro(f"erro no turno: {resumo['erro']}", traceback=traceback.format_exc())
+        return resumo
     finally:
         arquivo_trava().unlink(missing_ok=True)
         arquivo_parar().unlink(missing_ok=True)
         registro(
             f"fim do turno: {len(resumo['pr-aberto'])} PR(s), {len(resumo['estacionado'])} estacionado(s)"
             + (f", parou por: {resumo['pausa']}" if resumo["pausa"] else "")
+            + (f", erro: {resumo['erro']}" if resumo.get("erro") else "")
             + f" · quota semana {_pct(quota.semanal)}"
         )
