@@ -253,3 +253,89 @@ def claude_instalar(
         else:
             typer.echo(f" ✓ /{nome}: {situacao}")
     typer.echo(f"Pasta: {claude.pasta_comandos()}")
+
+
+# ---------------------------------------------------------------- turno: run, status, parar, assistir
+
+
+@app.command()
+def run(
+    projeto: str = typer.Option(None, "--projeto", "-p", help="Só este projeto (nome em `firma projetos`)."),
+    max_prds: int = typer.Option(None, "--max", help="Para depois de N PRDs."),
+    sem_pr: bool = typer.Option(False, "--sem-pr", help="Não faz push nem abre PR (fica só na branch local)."),
+    detalhe: bool = typer.Option(False, "--detalhe", help="Mostra também o texto dos agentes."),
+) -> None:
+    """Pega os PRDs prontos e leva cada um até um PR em rascunho."""
+    from firma import executor
+    from firma.eventos import Registro
+    from firma.sessao import rodar as rodar_sdk
+
+    registro = Registro(mostrar=typer.echo)
+
+    async def sessao(pedido, quota):
+        return await rodar_sdk(pedido, registro, quota, detalhe)
+
+    async def principal_async():
+        return await executor.rodar_turno(sessao, registro, projeto, max_prds, sem_pr)
+
+    try:
+        resumo = anyio.run(principal_async)
+    except RuntimeError as e:
+        typer.echo(str(e))
+        raise typer.Exit(1)
+    if resumo.get("pr-aberto"):
+        typer.echo("\nPRs para revisar: " + ", ".join(resumo["pr-aberto"]))
+    if resumo.get("estacionado"):
+        typer.echo("Estacionados (veja .firma/INBOX.md): " + ", ".join(resumo["estacionado"]))
+
+
+@app.command()
+def status() -> None:
+    """Mostra se há um turno rodando, a quota e a fila de cada projeto."""
+    from firma import executor, prd, registro
+    from firma.eventos import arquivo_do_dia, formatar
+    import json as _json
+    from pathlib import Path
+
+    trava = executor.trava_ativa()
+    typer.echo(f"Turno: {'rodando desde ' + str(trava.get('inicio', '?')) if trava is not None else 'parado'}")
+    q = executor.ler_quota()
+    if q:
+        typer.echo(f"Quota (às {q.get('em', '?')[11:16]}): semana {executor._pct(q.get('semanal'))}, 5 horas {executor._pct(q.get('cinco_horas'))}")
+    for proj in registro.listar():
+        backlog = Path(proj["caminho"]) / ".firma" / "backlog"
+        prds = prd.listar(backlog) if backlog.exists() else []
+        contagem = {}
+        for p in prds:
+            contagem[p.status] = contagem.get(p.status, 0) + 1
+        texto = ", ".join(f"{n} {s}" for s, n in contagem.items()) or "backlog vazio"
+        typer.echo(f" • {proj['nome']}: {texto}")
+    log = arquivo_do_dia()
+    if log.exists():
+        typer.echo("\nÚltimos eventos:")
+        for linha in log.read_text(encoding="utf-8").splitlines()[-8:]:
+            typer.echo("  " + formatar(_json.loads(linha)))
+
+
+@app.command()
+def parar() -> None:
+    """Pede para o turno parar na próxima fronteira de tarefa (depois do commit)."""
+    from firma import executor
+
+    if executor.trava_ativa() is None:
+        typer.echo("Nenhum turno rodando.")
+        return
+    executor.pedir_parada()
+    typer.echo("Pedido registrado: o turno para depois da sessão atual, sem perder trabalho.")
+
+
+@app.command()
+def assistir() -> None:
+    """Acompanha ao vivo o que a Firma está fazendo (Ctrl+C para sair)."""
+    from firma.eventos import seguir
+
+    try:
+        for linha in seguir():
+            typer.echo(linha)
+    except KeyboardInterrupt:
+        pass
