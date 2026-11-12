@@ -2,10 +2,20 @@
 
 from __future__ import annotations
 
+import sys
+
 import anyio
 import typer
 
 from firma import __version__
+
+# No Windows, quando a saída vai para um pipe (como no shell do Claude Code), o Python usa cp1252
+# e quebra ao imprimir "✓". Forçamos UTF-8 e trocamos o que não couber em vez de falhar.
+for _fluxo in (sys.stdout, sys.stderr):
+    try:
+        _fluxo.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 from firma.doctor import AVISO, FALHA, OK, rodar_checagens
 
 app = typer.Typer(help="Firma: PRDs entram, PRs saem.", no_args_is_help=True, add_completion=False)
