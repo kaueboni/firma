@@ -465,7 +465,9 @@ def dependencias_ok(raiz: Path, p: prdmod.Prd, backlog: Path) -> tuple[bool, str
 def fila(raiz: Path) -> list[Path]:
     """PRDs prontos (inclui os pausados, que voltam como pronto), por prioridade e id."""
     backlog = raiz / ".firma" / "backlog"
-    prds = [p for p in prdmod.listar(backlog) if p.status == "pronto"]
+    # Um PRD em "em-execucao" quando nenhum turno está rodando ficou órfão (queda, Ctrl+C):
+    # volta para a fila e retoma do estado salvo.
+    prds = [p for p in prdmod.listar(backlog) if p.status in ("pronto", "em-execucao")]
     prds.sort(key=lambda p: (int(p.meta.get("prioridade", 3)), p.id))
     return [p.caminho for p in prds]
 

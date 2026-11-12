@@ -227,8 +227,15 @@ def prd_pronto(alvo: str = typer.Argument(..., help="Id (PRD-001 ou 1) ou caminh
     if not r.pronto:
         typer.echo(f"\n{p.id} continua em {p.status}: corrija os erros acima.")
         raise typer.Exit(1)
-    if p.status not in ("rascunho", "pronto"):
-        typer.echo(f"{p.id} está em {p.status}; só PRDs em rascunho entram na fila.")
+    if p.status in ("em-execucao", "estacionado"):
+        from firma import executor
+
+        if executor.trava_ativa() is not None:
+            typer.echo(f"{p.id} está em {p.status} e há um turno rodando; espere ou use `firma parar`.")
+            raise typer.Exit(1)
+        typer.echo(f" ✓ {p.id} estava em {p.status}; volta para a fila e retoma de onde parou.")
+    elif p.status not in ("rascunho", "pronto"):
+        typer.echo(f"{p.id} está em {p.status}; não volta para a fila.")
         raise typer.Exit(1)
     prd.mudar_status(caminho, "pronto")
     typer.echo(f" ✓ {p.id} está pronto e entra na fila.")

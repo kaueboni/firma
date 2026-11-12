@@ -223,3 +223,12 @@ def test_caminho_curto_e_feed():
         feed(t)
     feed.fechar()
     assert linhas == ["Read a", "  ↳ mais 2 vez(es)", "Read b"]
+
+
+def test_orfao_em_execucao_volta_para_a_fila(projeto):
+    caminho = projeto / ".firma/backlog/PRD-001-carrinho.md"
+    prd.mudar_status(caminho, "em-execucao")
+    assert executor.fila(projeto) == [caminho]
+    r = CliRunner().invoke(app, ["prd", "pronto", "PRD-001"])
+    assert r.exit_code == 0 and "volta para a fila" in r.output
+    assert prd.ler(caminho).status == "pronto"
