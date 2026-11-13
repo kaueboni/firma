@@ -41,6 +41,9 @@ def doctor(
     quota: bool = typer.Option(
         False, "--quota", help="Faz uma chamada mínima pelo Agent SDK e mostra o estado da quota."
     ),
+    opencode: bool = typer.Option(
+        False, "--opencode", help="Sobe o OpenCode e faz uma chamada mínima em cada modelo não-Claude do projeto."
+    ),
 ) -> None:
     """Confere se esta máquina tem o que a Firma precisa."""
     checagens = rodar_checagens()
@@ -53,8 +56,47 @@ def doctor(
             typer.echo("\nCorrija as falhas acima antes de sondar a quota.")
             raise typer.Exit(1)
         _sondar_quota()
+    if opencode and not _sondar_opencode():
+        raise typer.Exit(1)
     if falhou:
         raise typer.Exit(1)
+
+
+def _sondar_opencode() -> bool:
+    from pathlib import Path
+
+    from firma import config, projeto
+    from firma.runtime import opencode as oc
+
+    raiz = projeto.raiz_git(Path.cwd()) or Path.cwd()
+    modelos: list[tuple[str, str]] = []
+    if (raiz / ".firma" / "config.toml").exists():
+        cfg = config.carregar(raiz)
+        for papel in config.SECOES_PAPEL:
+            m = config.modelo_do_papel(cfg, papel)
+            for prov, mod in ((m.provider, m.model), (m.fallback_provider, m.fallback_model)):
+                if prov and prov != "anthropic" and (prov, mod) not in modelos:
+                    modelos.append((prov, mod))
+    if not modelos:
+        modelos = [config.FALLBACK_PADRAO]
+    typer.echo("")
+    typer.echo(f"Sondando o OpenCode em {raiz} ({', '.join(f'{p}/{m}' for p, m in modelos)})...")
+    resultado = anyio.run(oc.sondar, raiz, modelos)
+    typer.echo(f"Detalhe salvo em {oc.salvar_sonda(resultado)}")
+    if resultado.get("erro"):
+        typer.echo(f" ✗ OpenCode: {resultado['erro']}")
+        return False
+    typer.echo(f" ✓ OpenCode {resultado.get('versao')} · provedores conectados: {', '.join(resultado.get('conectados') or []) or 'nenhum'}")
+    tudo_ok = True
+    for item in resultado["modelos"]:
+        if item["ok"]:
+            typer.echo(f" ✓ {item['provider']}/{item['model']}: respondeu ({item['tokens']} tokens)")
+        else:
+            tudo_ok = False
+            typer.echo(f" ✗ {item['provider']}/{item['model']}: {item['erro']}")
+    if not tudo_ok:
+        typer.echo("Para conectar o Gemini: `opencode auth login` e escolha Google (chave do AI Studio).")
+    return tudo_ok
 
 
 @app.command()

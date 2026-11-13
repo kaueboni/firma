@@ -38,3 +38,18 @@ def test_comando_ok_usa_primeira_linha():
     c = checar_comando("git", ["git", "--version"], "", executar=lambda cmd: _resultado(0, "git version 2.45\n"))
     assert c.estado == OK
     assert c.detalhe == "git version 2.45"
+
+
+def test_checar_opencode(monkeypatch):
+    import subprocess as sp
+
+    from firma import doctor
+    from firma.runtime import opencode
+
+    monkeypatch.setattr(opencode, "comando_opencode", lambda: None)
+    assert doctor.checar_opencode().estado == doctor.FALHA
+    monkeypatch.setattr(opencode, "comando_opencode", lambda: ["opencode"])
+    velho = lambda cmd: sp.CompletedProcess(cmd, 0, "1.2.0\n", "")
+    novo = lambda cmd: sp.CompletedProcess(cmd, 0, "1.19.5\n", "")
+    assert doctor.checar_opencode(velho).estado == doctor.FALHA
+    assert doctor.checar_opencode(novo).estado == doctor.OK

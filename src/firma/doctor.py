@@ -87,5 +87,26 @@ def checar_sdk() -> Checagem:
     return Checagem("Claude Agent SDK", OK, getattr(claude_agent_sdk, "__version__", "instalado"))
 
 
+def checar_opencode(executar: Executor = _executar) -> Checagem:
+    """O OpenCode roda os papéis no Gemini (por config ou como fallback quando o Claude fica sem quota)."""
+    from firma.runtime.opencode import OPENCODE_MIN_VERSION, comando_opencode, versao
+
+    minimo = ".".join(map(str, OPENCODE_MIN_VERSION))
+    cmd = comando_opencode()
+    if cmd is None:
+        return Checagem("OpenCode", FALHA, f"`opencode` não encontrado. Instale com `npm install -g opencode-ai` ({minimo}+).")
+    try:
+        r = executar([*cmd, "--version"])
+    except (OSError, subprocess.SubprocessError) as e:
+        return Checagem("OpenCode", FALHA, f"erro ao rodar `opencode --version`: {e}")
+    texto = (r.stdout or "").strip().splitlines()[-1:] or [""]
+    v = versao(texto[0])
+    if not v:
+        return Checagem("OpenCode", AVISO, f"versão não reconhecida: {texto[0]!r}")
+    if v < OPENCODE_MIN_VERSION:
+        return Checagem("OpenCode", FALHA, f"{texto[0]} é antigo; precisa de {minimo}+ (`opencode upgrade`)")
+    return Checagem("OpenCode", OK, f"{texto[0]} (confira o Gemini com `firma doctor --opencode`)")
+
+
 def rodar_checagens() -> list[Checagem]:
-    return [checar_python(), checar_git(), checar_gh(), checar_sdk(), checar_credencial()]
+    return [checar_python(), checar_git(), checar_gh(), checar_sdk(), checar_credencial(), checar_opencode()]

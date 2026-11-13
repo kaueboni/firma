@@ -277,16 +277,19 @@ class Turno:
         trocou_de: str | None = None
         for provider, modelo in alvos:
             if provider in self.esgotados:
-                trocou_de = trocou_de or "anthropic"
+                trocou_de = trocou_de or provider
                 continue
+            # Sessões nunca atravessam provedores; no fallback, o papel retoma a própria sessão do
+            # fallback se já tiver uma neste PRD, e só recebe o handoff quando começa do zero.
+            resume = estado.sessao(papel, provider, modelo) if retomar else None
             texto = prompt
-            if trocou_de:
+            if trocou_de and resume is None:
                 texto += "\n\n" + self._handoff(f"o provedor {trocou_de} ficou sem quota; você continua o trabalho do papel {papel}")
             elif com_handoff:
                 texto += "\n\n" + self._handoff(com_handoff)
             pedido = Pedido(
                 papel, texto, wt, prd_id,
-                resume=estado.sessao(papel, provider, modelo) if retomar and not trocou_de else None,
+                resume=resume,
                 provider=provider, modelo=modelo or None,
                 permissao=self.cfg["execucao"].get("permissao", "bypassPermissions"),
                 **kw,

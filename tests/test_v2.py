@@ -136,6 +136,9 @@ def test_quota_do_claude_aciona_fallback_com_handoff(projeto):
     assert google and google[0].papel == "developer"
     assert "Handoff da Firma" in google[0].prompt and "parcial.py" in google[0].prompt
     assert google[0].resume is None  # sessão nunca reaproveitada entre provedores
+    devs_google = [p for p in google if p.papel == "developer"]
+    assert devs_google[1].resume == "s-dev"  # no fallback, retoma a própria sessão do Gemini
+    assert "Handoff da Firma" not in devs_google[1].prompt
     # depois de esgotar, o resto do turno vai direto para o fallback
     depois = roteiro.pedidos[roteiro.pedidos.index(google[0]):]
     assert all(p.provider == "google" for p in depois)
