@@ -25,6 +25,7 @@ _REDE = re.compile(
     r"network|dns|timed? ?out|unreachable",
     re.IGNORECASE,
 )
+_SOBRECARGA = re.compile(r"high demand|overloaded|temporarily unavailable|service unavailable|try again later", re.IGNORECASE)
 _AUTENTICACAO = re.compile(r"unauthori[sz]ed|invalid (api )?key|api key not valid|authentication|forbidden|permission denied|expired", re.IGNORECASE)
 _CONFIGURACAO = re.compile(r"model.*(not found|unavailable|does not exist)|unknown model|invalid request|bad request", re.IGNORECASE)
 
@@ -40,6 +41,8 @@ def classificar(status: int | None = None, mensagem: str = "") -> str:
         return AUTENTICACAO
     if status in (400, 404, 422):
         return CONFIGURACAO
+    if _SOBRECARGA.search(msg):
+        return TRANSITORIO
     if _QUOTA.search(msg):
         return QUOTA
     if _AUTENTICACAO.search(msg):

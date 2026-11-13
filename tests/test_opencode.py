@@ -162,3 +162,25 @@ def test_regras_do_guarda_compilam_em_js():
 def test_plugin_exporta_so_o_plugin():
     texto = occ.caminho_plugin().read_text(encoding="utf-8")
     assert re.findall(r"^export\s+\w+\s+(\w+)", texto, re.MULTILINE) == ["FirmaGuarda"]
+
+
+def test_sobrecarga_tenta_de_novo(tmp_path, monkeypatch):
+    monkeypatch.setattr(erros, "ESPERAS_TRANSITORIO", (0, 0))
+    ocupado = {"info": {"error": {"name": "UnknownError", "data": {"message": "This model is currently experiencing high demand. Please try again later."}}}, "parts": []}
+
+    class Ocupado(Servidor):
+        def __init__(self):
+            super().__init__()
+            self.respostas = [ocupado, ocupado, self.resposta]
+
+        def __call__(self, req):
+            if req.url.path.endswith("/message"):
+                self.chamadas.append(("POST", req.url.path, None))
+                return httpx.Response(200, json=self.respostas.pop(0))
+            return super().__call__(req)
+
+    r, linhas, srv = _rodar(Ocupado(), tmp_path)
+    assert r.erro is None and r.texto.endswith("APROVADO")
+    assert sum(1 for c in srv.chamadas if c[1].endswith("/message")) == 3
+    assert any("nova tentativa" in l for l in linhas)
+    assert erros.classificar(None, "This model is currently experiencing high demand") == erros.TRANSITORIO

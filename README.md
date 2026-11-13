@@ -91,7 +91,7 @@ rodadas = 3
 provider = "anthropic"
 model = ""                        # vazio = o padrão do Claude Code
 fallback_provider = "google"
-fallback_model = "gemini-3.1-pro-preview"
+fallback_model = "gemini-3.8-flash"
 ```
 
 O formato antigo (`[modelos]` com `trabalho` e `advisor`) continua funcionando: vira Claude com fallback para o Gemini.

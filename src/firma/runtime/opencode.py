@@ -264,6 +264,19 @@ class HostOpencode:
         return r.json()["id"]
 
     async def rodar(self, pedido: Pedido) -> Resposta:
+        """Roda a sessão; sobrecarga momentânea do provedor tenta de novo (5s, 15s) na mesma sessão."""
+        esperas = list(erros.ESPERAS_TRANSITORIO)
+        while True:
+            r = await self._rodar_uma(pedido)
+            if r.tipo_erro != erros.TRANSITORIO or not esperas:
+                return r
+            espera = esperas.pop(0)
+            self.registro(f"{pedido.provider} sobrecarregado: nova tentativa em {espera}s", prd=pedido.prd, papel=pedido.papel)
+            await anyio.sleep(espera)
+            if r.session_id:
+                pedido.resume = r.session_id
+
+    async def _rodar_uma(self, pedido: Pedido) -> Resposta:
         if not pedido.modelo:
             return self._falha(pedido, erros.CONFIGURACAO, f"o papel {pedido.papel} está em {pedido.provider} sem `model` no config.toml")
         try:
