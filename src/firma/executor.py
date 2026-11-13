@@ -1,6 +1,6 @@
 """O turno da Firma: pega PRDs prontos e leva cada um até um PR em rascunho.
 
-As regras do processo (ordem, rodadas, paradas, quota, commits, push) são código aqui.
+As regras do processo (ordem, rodadas, paradas, quota, fallback, commits, push) são código aqui.
 Os modelos só fazem o que precisa de inteligência: spec, código, auditoria e conselho.
 """
 
@@ -8,51 +8,41 @@ from __future__ import annotations
 
 import json
 import re
-import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from firma import gitops, prd as prdmod
+from firma import gitops, handoff as handoffmod, prd as prdmod
+from firma.config import modelo_do_papel, SECOES_PAPEL
+from firma.estado import EstadoCorrompido, EstadoPrd
 from firma.registro import home_firma
-from firma.sessao import Pedido, Quota, Resposta
+from firma.runtime import erros
+from firma.runtime.base import Pedido, Quota, Resposta
+from firma.trava import (  # noqa: F401  (reexportados para a CLI e os testes)
+    arquivo_parar,
+    arquivo_trava,
+    criar_trava,
+    pedir_parada,
+    renovar_trava,
+    soltar_trava,
+    trava_ativa,
+)
 
 RodarSessao = Callable[[Pedido, Quota], Awaitable[Resposta]]
 
-LEITURA = ["Read", "Grep", "Glob"]
+LEITURA = ["Read", "Grep", "Glob", "Skill"]
+ESCRITA = ["Write", "Edit"]
 TAREFA = re.compile(r"^\s*-\s*\[( |x|X)\]\s*(T\d+)\s*[:.)\-–—]\s*(.+?)\s*$", re.MULTILINE)
-VEREDITO = re.compile(r"VEREDITO:\s*\**\s*(APROVADO|REPROVADO)", re.IGNORECASE)
+VEREDITO = re.compile(r"\bVEREDITO\**\s*:\s*\**\s*(APROVADO|REPROVADO)\b", re.IGNORECASE)
+SKILLS = (
+    "Antes de começar, veja as skills do projeto (ferramenta Skill) e as instruções em CLAUDE.md/AGENTS.md, "
+    "se existirem, e siga-as."
+)
 
 
-# ---------------------------------------------------------------- estado em disco
-
-
-def arquivo_parar() -> Path:
-    return home_firma() / "parar"
-
-
-def arquivo_trava() -> Path:
-    return home_firma() / "run.lock"
-
-
-def pedir_parada() -> None:
-    arquivo_parar().parent.mkdir(parents=True, exist_ok=True)
-    arquivo_parar().write_text(datetime.now().isoformat(), encoding="utf-8")
-
-
-def trava_ativa(validade_s: int = 30 * 60) -> dict | None:
-    """A trava vale enquanto o run a renova (a cada evento). Velha demais = run morreu."""
-    caminho = arquivo_trava()
-    if not caminho.exists():
-        return None
-    if time.time() - caminho.stat().st_mtime > validade_s:
-        return None
-    try:
-        return json.loads(caminho.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+# ---------------------------------------------------------------- quota em disco
 
 
 def salvar_quota(q: Quota) -> None:
@@ -67,31 +57,6 @@ def ler_quota() -> dict:
         return json.loads((home_firma() / "quota.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
-
-
-@dataclass
-class EstadoPrd:
-    fase: str = "spec"  # spec → tarefas → fim
-    feitas: list[str] = field(default_factory=list)
-    sessoes: dict[str, str] = field(default_factory=dict)
-    pr: str = ""
-    decisoes: list[str] = field(default_factory=list)
-
-    @staticmethod
-    def caminho(raiz: Path, prd_id: str) -> Path:
-        return raiz / ".firma" / "estado" / f"{prd_id}.json"
-
-    @classmethod
-    def carregar(cls, raiz: Path, prd_id: str) -> "EstadoPrd":
-        c = cls.caminho(raiz, prd_id)
-        if c.exists():
-            return cls(**json.loads(c.read_text(encoding="utf-8")))
-        return cls()
-
-    def salvar(self, raiz: Path, prd_id: str) -> None:
-        c = self.caminho(raiz, prd_id)
-        c.parent.mkdir(parents=True, exist_ok=True)
-        c.write_text(json.dumps(self.__dict__, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def tarefas(plano: str) -> list[tuple[str, str, bool]]:
@@ -128,14 +93,24 @@ def _prompt_techlead(prd_texto: str, docs: str, partes: list[dict]) -> str:
   O que fazer e qual teste prova que ficou pronto.
 - [ ] T2: ...
 
-Regras: não escreva código nem testes; só esses dois arquivos. Cada critério de aceite do PRD precisa estar coberto por alguma tarefa. Comandos de verificação do projeto: {json.dumps(partes, ensure_ascii=False)}.
+{SKILLS}
+
+Regras: não escreva código nem testes; só esses dois arquivos, e só dentro de `{docs}/`. Cada critério de aceite do PRD precisa estar coberto por alguma tarefa. Comandos de verificação do projeto: {json.dumps(partes, ensure_ascii=False)}.
 
 PRD:
 {prd_texto}"""
 
 
+def _prompt_correcao_spec(docs: str, parecer: str) -> str:
+    return f"""O advisor reprovou a spec. Corrija `{docs}/spec.md` e `{docs}/plano.md` (mantendo o formato `- [ ] T1: título` no plano) para resolver exatamente estes pontos:
+
+{parecer}"""
+
+
 def _prompt_revisao_spec(prd_texto: str, docs: str) -> str:
-    return f"""Você é o advisor da Firma e decide em nome do dono do projeto. Revise `{docs}/spec.md` e `{docs}/plano.md` contra o PRD abaixo e o código.
+    return f"""Você é o advisor da Firma e decide em nome do dono do projeto. Revise `{docs}/spec.md` e `{docs}/plano.md` contra o PRD abaixo e o código. Você só lê: não edita arquivos nem roda comandos.
+
+{SKILLS}
 
 Aprove se a spec é viável neste código, cobre todos os critérios de aceite e respeita o "Fora de escopo" e os "Limites do advisor". Se reprovar, liste só os problemas que impedem a implementação, cada um com a correção.
 
@@ -149,9 +124,11 @@ def _prompt_developer(tarefa: tuple[str, str, bool], docs: str, partes: list[dic
     tid, titulo, _ = tarefa
     base = f"""Você é o developer da Firma. Implemente SOMENTE a tarefa {tid} ("{titulo}") de `{docs}/plano.md`, seguindo `{docs}/spec.md` e o PRD em `{docs}/prd.md`.
 
+{SKILLS}
+
 Use TDD: escreva ou ajuste o teste primeiro, veja falhar, implemente, veja passar. Rode os testes e o lint das partes que você mexer: {json.dumps(partes, ensure_ascii=False)}.
 
-Não faça commit, push nem mude de branch (a Firma faz isso). Não instale dependência nova. Não mexa em tarefas futuras. Termine com um resumo de 3 a 5 linhas do que mudou."""
+Não faça commit, push nem mude de branch (a Firma faz isso). Não instale dependência nova. Não mexa em tarefas futuras, em `{docs}/`, em `.claude/` nem em `.opencode/`. Termine com um resumo de 3 a 5 linhas do que mudou."""
     if retorno:
         base += f"\n\nA rodada anterior desta tarefa foi recusada. Corrija exatamente isto:\n{retorno}"
     return base
@@ -159,7 +136,9 @@ Não faça commit, push nem mude de branch (a Firma faz isso). Não instale depe
 
 def _prompt_auditor(tarefa: tuple[str, str, bool], docs: str, diff: str, verificacoes: str) -> str:
     tid, titulo, _ = tarefa
-    return f"""Você é o auditor da Firma. Audite a tarefa {tid} ("{titulo}") de `{docs}/plano.md`, contra `{docs}/spec.md` e `{docs}/prd.md`. Você não edita arquivos.
+    return f"""Você é o auditor da Firma. Audite a tarefa {tid} ("{titulo}") de `{docs}/plano.md`, contra `{docs}/spec.md` e `{docs}/prd.md`. Você só lê: não edita arquivos nem roda comandos (a Firma já rodou os testes e o lint).
+
+{SKILLS}
 
 Confira: a tarefa foi feita por inteiro e só ela; há teste que prova o comportamento; nada fora do escopo; nada que viole os "Limites do advisor" do PRD (por exemplo, dependência nova); código legível e coerente com o resto do projeto.
 
@@ -175,7 +154,9 @@ Se reprovar, liste só os itens críticos ou importantes, cada um com a correç�
 def _prompt_diagnostico(tarefa: tuple[str, str, bool], docs: str, historico: list[str]) -> str:
     tid, titulo, _ = tarefa
     pareceres = "\n\n---\n\n".join(historico)
-    return f"""Você é o advisor da Firma. A tarefa {tid} ("{titulo}") de `{docs}/plano.md` foi recusada em todas as rodadas. Leia os pareceres abaixo e o código atual na worktree, e diga em até 10 linhas: a causa raiz e a correção que o developer deve fazer. Se a tarefa for impossível sem algo que você não pode decidir (mudança irreversível, dependência nova, algo fora do PRD), comece a resposta com "BLOQUEIO:" e explique.
+    return f"""Você é o advisor da Firma. A tarefa {tid} ("{titulo}") de `{docs}/plano.md` foi recusada em todas as rodadas. Leia os pareceres abaixo e o código atual na worktree (só leitura), e diga em até 10 linhas: a causa raiz e a correção que o developer deve fazer. Se a tarefa for impossível sem algo que você não pode decidir (mudança irreversível, dependência nova, algo fora do PRD), comece a resposta com "BLOQUEIO:" e explique.
+
+{SKILLS}
 
 Pareceres:
 {pareceres}"""
@@ -204,6 +185,18 @@ class Estacionar(Exception):
 
 
 @dataclass
+class _Contexto:
+    """O PRD em execução, para as sessões montarem o handoff quando trocam de provedor."""
+
+    prd_id: str
+    branch: str
+    wt: Path
+    docs: str
+    estado: EstadoPrd
+    tarefa: tuple[str, str] | None = None
+
+
+@dataclass
 class Turno:
     raiz: Path
     cfg: dict
@@ -211,35 +204,114 @@ class Turno:
     quota: Quota
     rodar_sessao: RodarSessao
     sem_pr: bool = False
+    # provedores sem quota neste `firma run` (compartilhado entre projetos)
+    esgotados: set[str] = field(default_factory=set)
+    _ctx: _Contexto | None = None
 
     @property
     def partes(self) -> list[dict]:
         return self.cfg.get("partes") or []
+
+    def _teto_atingido(self) -> str | None:
+        teto = float(self.cfg["quota"].get("teto_semanal", 0.6))
+        if self.quota.rejeitado:
+            return "limite da assinatura Claude atingido"
+        if self.quota.semanal is not None and self.quota.semanal >= teto:
+            return f"quota semanal em {self.quota.semanal:.0%}, teto de {teto:.0%}"
+        return None
+
+    def _sem_saida(self) -> list[str]:
+        """Papéis que não têm nenhum provedor disponível agora."""
+        presos = []
+        for papel in SECOES_PAPEL:
+            m = modelo_do_papel(self.cfg, papel)
+            opcoes = [m.provider] + ([m.fallback_provider] if m.tem_fallback else [])
+            if all(p in self.esgotados for p in opcoes):
+                presos.append(papel)
+        return presos
 
     def checar_limites(self) -> None:
         if arquivo_parar().exists():
             raise Pausa("parada pedida (firma parar)")
         if not dentro_da_janela(self.cfg["quota"].get("janela", "")):
             raise Pausa("fora da janela configurada")
-        teto = float(self.cfg["quota"].get("teto_semanal", 0.6))
-        if self.quota.semanal is not None and self.quota.semanal >= teto:
-            raise Pausa(f"quota semanal em {self.quota.semanal:.0%}, teto de {teto:.0%}")
-        if self.quota.rejeitado:
-            raise Pausa("limite da assinatura atingido")
-        arquivo_trava().touch(exist_ok=True)
+        motivo = self._teto_atingido()
+        if motivo and "anthropic" not in self.esgotados:
+            self.esgotados.add("anthropic")
+            self.registro(f"{motivo}: o Claude fica de fora pelo resto do turno")
+        if motivo and self._sem_saida():
+            raise Pausa(motivo)
+        if not arquivo_trava().exists():
+            criar_trava()
+        renovar_trava(forcar=True)
 
-    async def sessao(self, pedido: Pedido) -> Resposta:
+    def _alvos(self, papel: str) -> list[tuple[str, str]]:
+        m = modelo_do_papel(self.cfg, papel)
+        alvos = [(m.provider, m.model)]
+        if m.tem_fallback and (m.fallback_provider, m.fallback_model) != alvos[0]:
+            alvos.append((m.fallback_provider, m.fallback_model))
+        return alvos
+
+    def _handoff(self, motivo: str) -> str:
+        c = self._ctx
+        if c is None:
+            return ""
+        texto = handoffmod.montar(c.prd_id, c.branch, c.wt, c.estado, c.tarefa, motivo)
+        handoffmod.salvar(self.raiz, c.prd_id, texto)
+        return texto
+
+    async def sessao(
+        self,
+        papel: str,
+        prompt: str,
+        wt: Path,
+        prd_id: str,
+        estado: EstadoPrd,
+        retomar: bool = False,
+        com_handoff: str | None = None,
+        **kw,
+    ) -> Resposta:
+        """Roda o papel no provedor configurado; sem quota, passa para o fallback com handoff."""
         self.checar_limites()
-        pedido.permissao = self.cfg["execucao"].get("permissao", "bypassPermissions")
-        if not pedido.modelo and self.cfg["modelos"].get("trabalho"):
-            pedido.modelo = self.cfg["modelos"]["trabalho"]
-        r = await self.rodar_sessao(pedido, self.quota)
-        salvar_quota(self.quota)
-        if r.sem_quota:
-            raise Pausa("limite da assinatura atingido durante a sessão")
-        if r.erro:
-            raise Estacionar(f"{pedido.papel}: {r.erro}")
-        return r
+        alvos = self._alvos(papel)
+        trocou_de: str | None = None
+        for provider, modelo in alvos:
+            if provider in self.esgotados:
+                trocou_de = trocou_de or "anthropic"
+                continue
+            texto = prompt
+            if trocou_de:
+                texto += "\n\n" + self._handoff(f"o provedor {trocou_de} ficou sem quota; você continua o trabalho do papel {papel}")
+            elif com_handoff:
+                texto += "\n\n" + self._handoff(com_handoff)
+            pedido = Pedido(
+                papel, texto, wt, prd_id,
+                resume=estado.sessao(papel, provider, modelo) if retomar and not trocou_de else None,
+                provider=provider, modelo=modelo or None,
+                permissao=self.cfg["execucao"].get("permissao", "bypassPermissions"),
+                **kw,
+            )
+            r = await self.rodar_sessao(pedido, self.quota)
+            salvar_quota(self.quota)
+            if r.sem_quota or r.tipo_erro == erros.QUOTA:
+                self.esgotados.add(provider)
+                estado.provedores_esgotados = sorted(self.esgotados)
+                proximos = [a for a in alvos if a[0] not in self.esgotados]
+                if proximos:
+                    self.registro(
+                        f"limite do provedor {provider} atingido em {papel}; alternando para {proximos[0][0]}/{proximos[0][1]}",
+                        prd=prd_id, papel="firma",
+                    )
+                trocou_de = provider
+                continue
+            if r.erro:
+                causa = f"{papel} ({provider}/{modelo or 'padrão'}): {r.erro}"
+                if r.tipo_erro and r.tipo_erro != erros.DESCONHECIDO:
+                    causa += f" [{r.tipo_erro}]"
+                raise Estacionar(causa)
+            estado.guardar_sessao(papel, provider, modelo, r.session_id)
+            return r
+        raise Pausa(f"limite de quota atingido ({papel} sem provedor disponível)")
 
     def _corpo_pr(self, p: prdmod.Prd, estado: EstadoPrd, lista: list[tuple[str, str, bool]], nota: str = "") -> str:
         itens = "\n".join(f"- [{'x' if t in estado.feitas else ' '}] {t}: {titulo}" for t, titulo, _ in lista)
@@ -252,9 +324,66 @@ class Turno:
             corpo += f"\n## Situação\n{nota}\n"
         return corpo
 
+    def _so_leitura(self, wt: Path, retrato: dict, papel: str, prd_id: str, permitido: str | None = None) -> None:
+        """Desfaz o que um papel sem escrita (ou com escrita restrita) mexeu fora do permitido."""
+        desfeitos = gitops.restaurar(wt, retrato, permitido)
+        if desfeitos:
+            self.registro(f"{papel} alterou o que não podia; desfeito: {', '.join(desfeitos[:10])}", prd=prd_id, papel="firma")
+
+    async def _techlead(self, p, wt, docs, estado, prompt) -> list[tuple[str, str, bool]]:
+        retrato = gitops.foto(wt)
+        await self.sessao(
+            "tech-lead", prompt, wt, p.id, estado, retomar=True,
+            escrita_so_em=docs, ferramentas=LEITURA + ESCRITA,
+        )
+        self._so_leitura(wt, retrato, "tech-lead", p.id, permitido=docs)
+        return tarefas(_ler(wt / docs / "plano.md"))
+
+    async def _advisor(self, p, wt, prompt, estado) -> Resposta:
+        retrato = gitops.foto(wt)
+        r = await self.sessao("advisor", prompt, wt, p.id, estado, pode_escrever=False, ferramentas=LEITURA)
+        self._so_leitura(wt, retrato, "advisor", p.id)
+        return r
+
+    async def _fase_spec(self, p, wt, docs, estado, prd_texto, log) -> list[tuple[str, str, bool]]:
+        lista = tarefas(_ler(wt / docs / "plano.md"))
+        if lista and (wt / docs / "spec.md").exists():
+            log("reaproveitando spec e plano da tentativa anterior", "tech-lead")
+        else:
+            lista = await self._techlead(p, wt, docs, estado, _prompt_techlead(prd_texto, docs, self.partes))
+        if not lista:
+            raise Estacionar("o tech-lead não produziu um plano no formato `- [ ] T1: título`")
+        log(f"spec e plano: {len(lista)} tarefa(s)", "tech-lead")
+        estado.salvar(self.raiz, p.id)
+
+        rev = await self._advisor(p, wt, _prompt_revisao_spec(prd_texto, docs), estado)
+        if not veredito(rev.texto):
+            log("reprovou a spec; o tech-lead corrige uma vez", "advisor")
+            _anotar(wt / docs / "decisoes.md", "Revisão da spec (reprovada)", rev.texto)
+            lista = await self._techlead(p, wt, docs, estado, _prompt_correcao_spec(docs, rev.texto))
+            if not lista:
+                raise Estacionar("o plano corrigido ficou sem tarefas no formato `- [ ] T1: título`")
+            estado.decisoes.append("spec revisada uma vez a pedido do advisor")
+            estado.salvar(self.raiz, p.id)
+            rev = await self._advisor(p, wt, _prompt_revisao_spec(prd_texto, docs), estado)
+            if not veredito(rev.texto):
+                _anotar(wt / docs / "decisoes.md", "Segunda revisão da spec (reprovada)", rev.texto)
+                raise Estacionar(
+                    "O advisor reprovou a spec mesmo após a correção do tech-lead.\n\nParecer:\n" + rev.texto.strip()[:2000]
+                )
+        estado.decisoes.append("spec e plano aprovados pelo advisor")
+        _anotar(wt / docs / "decisoes.md", "Revisão da spec (aprovada)", rev.texto)
+        return lista
+
     async def executar(self, caminho_prd: Path) -> str:
         p = prdmod.ler(caminho_prd)
-        estado = EstadoPrd.carregar(self.raiz, p.id)
+        try:
+            estado = EstadoPrd.carregar(self.raiz, p.id)
+        except EstadoCorrompido as e:
+            prdmod.mudar_status(caminho_prd, "estacionado")
+            _inbox(self.raiz, p.id, str(e))
+            self.registro(f"estacionado: {e}", prd=p.id, papel="firma")
+            return "estacionado"
         base = self.cfg["projeto"].get("branch_principal") or "main"
         github = (self.cfg["projeto"].get("github") or "").strip()
         usar_pr = bool(github) and not self.sem_pr
@@ -263,53 +392,29 @@ class Turno:
         log = lambda texto, papel="firma": self.registro(texto, prd=p.id, papel=papel)  # noqa: E731
 
         prdmod.mudar_status(caminho_prd, "em-execucao")
-        wt = gitops.preparar_worktree(self.raiz, p.id, base)
-        log(f"worktree {wt} na branch {branch}")
-        ligados = gitops.ligar_ambientes(self.raiz, wt, self.partes)
-        if ligados:
-            log("ambientes ligados do repositório principal: " + ", ".join(ligados))
-        (wt / docs).mkdir(parents=True, exist_ok=True)
-        (wt / docs / "prd.md").write_text(caminho_prd.read_text(encoding="utf-8-sig"), encoding="utf-8")
-        prd_texto = (wt / docs / "prd.md").read_text(encoding="utf-8")
         lista: list[tuple[str, str, bool]] = []
-
+        wt = self.raiz
         try:
-            if estado.fase == "spec":
-                r = await self.sessao(Pedido(
-                    "tech-lead", _prompt_techlead(prd_texto, docs, self.partes), wt, p.id,
-                    resume=estado.sessoes.get("tech-lead"), escrita_so_em=docs,
-                    ferramentas=LEITURA + ["Write", "Edit"], advisor=self.cfg["modelos"].get("advisor") or None,
-                ))
-                estado.sessoes["tech-lead"] = r.session_id or ""
-                lista = tarefas(_ler(wt / docs / "plano.md"))
-                if not lista:
-                    raise Estacionar("o tech-lead não produziu um plano no formato `- [ ] T1: título`")
-                log(f"spec e plano: {len(lista)} tarefa(s)", "tech-lead")
+            wt = gitops.preparar_worktree(self.raiz, p.id, base)
+            log(f"worktree {wt} na branch {branch}")
+            ligados = gitops.ligar_ambientes(self.raiz, wt, self.partes)
+            if ligados:
+                log("ambientes ligados do repositório principal: " + ", ".join(ligados))
+            self._ctx = _Contexto(p.id, branch, wt, docs, estado)
+            (wt / docs).mkdir(parents=True, exist_ok=True)
+            (wt / docs / "prd.md").write_text(caminho_prd.read_text(encoding="utf-8-sig"), encoding="utf-8")
+            prd_texto = (wt / docs / "prd.md").read_text(encoding="utf-8")
 
-                rev = await self.sessao(Pedido(
-                    "advisor", _prompt_revisao_spec(prd_texto, docs), wt, p.id, pode_escrever=False,
-                    ferramentas=LEITURA, modelo=self.cfg["modelos"].get("advisor") or None,
-                ))
-                if not veredito(rev.texto):
-                    log("reprovou a spec; o tech-lead corrige uma vez", "advisor")
-                    r = await self.sessao(Pedido(
-                        "tech-lead", f"O advisor reprovou a spec. Corrija spec.md e plano.md:\n\n{rev.texto}",
-                        wt, p.id, resume=estado.sessoes.get("tech-lead"), escrita_so_em=docs,
-                        ferramentas=LEITURA + ["Write", "Edit"],
-                    ))
-                    lista = tarefas(_ler(wt / docs / "plano.md"))
-                    if not lista:
-                        raise Estacionar("o plano corrigido ficou sem tarefas no formato esperado")
-                    estado.decisoes.append("spec revisada uma vez a pedido do advisor")
-                estado.decisoes.append("spec e plano aprovados pelo advisor")
-                _anotar(wt / docs / "decisoes.md", "Revisão da spec", rev.texto)
+            if estado.fase == "spec":
+                lista = await self._fase_spec(p, wt, docs, estado, prd_texto, log)
                 gitops.commit(wt, f"docs({p.id}): spec e plano\n\nGerado pela Firma.")
                 estado.fase = "tarefas"
+                estado.salvar(self.raiz, p.id)
                 if usar_pr:
                     gitops.push(wt, branch)
                     estado.pr = gitops.criar_pr(wt, base, branch, f"{p.id}: {p.titulo}", self._corpo_pr(p, estado, lista))
                     log(f"PR em rascunho: {estado.pr}")
-                estado.salvar(self.raiz, p.id)
+                    estado.salvar(self.raiz, p.id)
 
             lista = tarefas(_ler(wt / docs / "plano.md"))
             for tarefa in lista:
@@ -321,6 +426,7 @@ class Turno:
                 _marcar_feita(wt / docs / "plano.md", tid)
                 sha = gitops.commit(wt, f"feat({p.id}): {tid} — {titulo}\n\nGerado pela Firma.")
                 estado.feitas.append(tid)
+                estado.limpar_tarefa()
                 estado.salvar(self.raiz, p.id)
                 log(f"commit {sha or '(sem mudanças)'} · quota semana {_pct(self.quota.semanal)}")
                 if usar_pr:
@@ -357,6 +463,8 @@ class Turno:
             prdmod.mudar_status(caminho_prd, "pronto")
             log(f"interrompido ({type(e).__name__}): o PRD volta para a fila")
             raise
+        finally:
+            self._ctx = None
 
     def _estacionar(self, p, caminho_prd, estado, wt, usar_pr, lista, motivo, log) -> str:
         estado.salvar(self.raiz, p.id)
@@ -372,55 +480,79 @@ class Turno:
 
     async def _fazer_tarefa(self, p, wt: Path, docs: str, tarefa, estado: EstadoPrd) -> None:
         rodadas = int(self.cfg["execucao"].get("rodadas", 3))
-        retorno: str | None = None
-        historico: list[str] = []
-        advisor = self.cfg["modelos"].get("advisor") or None
+        tid = tarefa[0]
+        retomada = estado.tarefa_ativa == tid
+        if not retomada:
+            estado.limpar_tarefa()
+            estado.tarefa_ativa = tid
+        if self._ctx:
+            self._ctx.tarefa = (tid, tarefa[1])
+        retorno = estado.ultimo_retorno
+        historico = list(estado.historico_rodadas)
+        handoff_pendente = "retomando uma tarefa interrompida" if retomada and gitops.tem_mudancas_codigo(wt, docs) else None
+        if retomada:
+            self.registro(f"{tid}: retomando na rodada {estado.rodada_atual}", prd=p.id, papel="firma")
 
-        for rodada in range(1, rodadas + 2):  # a última só acontece depois do diagnóstico do advisor
-            if rodada == rodadas + 1:
-                diag = await self.sessao(Pedido(
-                    "advisor", _prompt_diagnostico(tarefa, docs, historico), wt, p.id,
-                    pode_escrever=False, ferramentas=LEITURA, modelo=advisor,
-                ))
-                _anotar(wt / docs / "decisoes.md", f"Diagnóstico da {tarefa[0]}", diag.texto)
-                if diag.texto.strip().upper().startswith("BLOQUEIO"):
-                    raise Estacionar(f"{tarefa[0]}: {diag.texto.strip()[:600]}")
-                estado.decisoes.append(f"{tarefa[0]}: última rodada com o diagnóstico do advisor")
-                retorno = f"Diagnóstico do advisor (última chance):\n{diag.texto}"
-
-            dev = await self.sessao(Pedido(
-                "developer", _prompt_developer(tarefa, docs, self.partes, retorno), wt, p.id,
-                resume=estado.sessoes.get("developer"), advisor=advisor,
-            ))
-            estado.sessoes["developer"] = dev.session_id or estado.sessoes.get("developer", "")
+        def guardar(rodada: int) -> None:
+            estado.rodada_atual, estado.ultimo_retorno, estado.historico_rodadas = rodada, retorno, list(historico)
             estado.salvar(self.raiz, p.id)
 
-            if not gitops.tem_mudancas(wt):
+        rodada = max(1, estado.rodada_atual)
+        diag_pendente: str | None = None
+        while rodada <= rodadas + 1:  # a última só acontece depois do diagnóstico do advisor
+            guardar(rodada)
+            if rodada == rodadas + 1 and not (retorno or "").startswith("Diagnóstico do advisor"):
+                diag = await self._advisor(p, wt, _prompt_diagnostico(tarefa, docs, historico), estado)
+                if diag.texto.strip().upper().startswith("BLOQUEIO"):
+                    _anotar(wt / docs / "decisoes.md", f"Diagnóstico da {tid}", diag.texto)
+                    raise Estacionar(f"{tid}: {diag.texto.strip()[:600]}")
+                estado.decisoes.append(f"{tid}: última rodada com o diagnóstico do advisor")
+                retorno = f"Diagnóstico do advisor (última chance):\n{diag.texto}"
+                diag_pendente = diag.texto  # anotado em decisoes.md só depois do developer
+                guardar(rodada)
+
+            await self.sessao(
+                "developer", _prompt_developer(tarefa, docs, self.partes, retorno), wt, p.id, estado,
+                retomar=True, com_handoff=handoff_pendente, escrita_proibida=[docs],
+            )
+            handoff_pendente = None
+            estado.salvar(self.raiz, p.id)
+
+            if diag_pendente:
+                _anotar(wt / docs / "decisoes.md", f"Diagnóstico da {tid}", diag_pendente)
+                diag_pendente = None
+
+            if not gitops.tem_mudancas_codigo(wt, docs):
                 retorno = "Nenhum arquivo foi alterado. Implemente a tarefa."
                 historico.append(f"Rodada {rodada}: o developer não alterou nada.")
+                rodada += 1
                 continue
 
-            verificacoes = gitops.rodar_verificacoes(wt, self.partes)
+            verificacoes = gitops.rodar_verificacoes(wt, self.partes, enquanto=renovar_trava)
             texto_verif = _texto_verificacoes(verificacoes)
             if any(not v.ok for v in verificacoes):
                 self.registro(f"verificações falharam (rodada {rodada})", prd=p.id, papel="firma")
                 retorno = f"As verificações falharam:\n{texto_verif}"
                 historico.append(f"Rodada {rodada}: verificações falharam.\n{texto_verif[-1500:]}")
+                rodada += 1
                 continue
 
-            aud = await self.sessao(Pedido(
-                "auditor", _prompt_auditor(tarefa, docs, gitops.diff(wt), texto_verif), wt, p.id,
-                resume=estado.sessoes.get("auditor"), pode_escrever=False, ferramentas=LEITURA + ["Bash"],
-            ))
-            estado.sessoes["auditor"] = aud.session_id or estado.sessoes.get("auditor", "")
+            retrato = gitops.foto(wt)
+            aud = await self.sessao(
+                "auditor", _prompt_auditor(tarefa, docs, gitops.diff(wt), texto_verif), wt, p.id, estado,
+                retomar=True, pode_escrever=False, ferramentas=LEITURA,
+            )
+            self._so_leitura(wt, retrato, "auditor", p.id)
             if veredito(aud.texto):
-                self.registro(f"{tarefa[0]} aprovada", prd=p.id, papel="auditor")
+                self.registro(f"{tid} aprovada", prd=p.id, papel="auditor")
                 return
-            self.registro(f"{tarefa[0]} reprovada (rodada {rodada})", prd=p.id, papel="auditor")
+            self.registro(f"{tid} reprovada (rodada {rodada})", prd=p.id, papel="auditor")
             retorno = aud.texto
             historico.append(f"Rodada {rodada}: auditor reprovou.\n{aud.texto[-2000:]}")
+            rodada += 1
 
-        raise Estacionar(f"{tarefa[0]} reprovada em todas as rodadas, inclusive depois do diagnóstico do advisor")
+        guardar(rodada)
+        raise Estacionar(f"{tid} reprovada em todas as rodadas, inclusive depois do diagnóstico do advisor")
 
 
 # ---------------------------------------------------------------- auxiliares
@@ -448,6 +580,7 @@ def _anotar(arquivo: Path, titulo: str, texto: str) -> None:
 
 def _inbox(raiz: Path, prd_id: str, motivo: str) -> None:
     caminho = raiz / ".firma" / "INBOX.md"
+    caminho.parent.mkdir(parents=True, exist_ok=True)
     with caminho.open("a", encoding="utf-8") as f:
         f.write(f"\n## {prd_id} — {datetime.now():%d/%m %H:%M}\n\n{motivo}\n")
 
@@ -483,17 +616,15 @@ async def rodar_turno(
     sem_pr: bool = False,
 ) -> dict:
     """Passa por todos os projetos registrados (ou um só) até a fila acabar ou um limite parar."""
-    import os
-
     from firma import config, registro as reg
 
     if trava_ativa():
         raise RuntimeError("já existe um `firma run` rodando nesta máquina (veja `firma status`)")
-    arquivo_trava().parent.mkdir(parents=True, exist_ok=True)
-    arquivo_trava().write_text(json.dumps({"pid": os.getpid(), "inicio": datetime.now().isoformat(timespec="seconds")}), encoding="utf-8")
+    criar_trava()
     arquivo_parar().unlink(missing_ok=True)
 
     quota = Quota()
+    esgotados: set[str] = set()
     resumo: dict = {"pr-aberto": [], "estacionado": [], "pausa": "", "pulados": []}
     feitos = 0
     try:
@@ -505,7 +636,7 @@ async def rodar_turno(
                 registro(f"projeto {proj['nome']} sem .firma/config.toml, pulado")
                 continue
             cfg = config.carregar(raiz)
-            turno = Turno(raiz, cfg, registro, quota, rodar_sessao, sem_pr)
+            turno = Turno(raiz, cfg, registro, quota, rodar_sessao, sem_pr, esgotados)
             backlog = raiz / ".firma" / "backlog"
             for caminho in fila(raiz):
                 if max_prds is not None and feitos >= max_prds:
@@ -531,11 +662,12 @@ async def rodar_turno(
         registro(f"erro no turno: {resumo['erro']}", traceback=traceback.format_exc())
         return resumo
     finally:
-        arquivo_trava().unlink(missing_ok=True)
+        soltar_trava()
         arquivo_parar().unlink(missing_ok=True)
         registro(
             f"fim do turno: {len(resumo['pr-aberto'])} PR(s), {len(resumo['estacionado'])} estacionado(s)"
             + (f", parou por: {resumo['pausa']}" if resumo["pausa"] else "")
             + (f", erro: {resumo['erro']}" if resumo.get("erro") else "")
             + f" · quota semana {_pct(quota.semanal)}"
+            + (f" · sem quota: {', '.join(sorted(esgotados))}" if esgotados else "")
         )

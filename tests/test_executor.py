@@ -7,8 +7,9 @@ import pytest
 from typer.testing import CliRunner
 
 from firma import executor, prd, registro
+from firma.estado import EstadoPrd
 from firma.cli import app
-from firma.sessao import Resposta
+from firma.runtime.base import Resposta
 
 from test_prd import PRONTO
 
@@ -51,9 +52,11 @@ class Roteiro:
         self.auditor = list(auditor or ["VEREDITO: APROVADO"])
         self.advisor_diag = advisor_diag
         self.chamadas = []
+        self.pedidos = []
 
     async def __call__(self, pedido, quota):
         self.chamadas.append(pedido.papel)
+        self.pedidos.append(pedido)
         docs = pedido.cwd / "docs" / "firma" / "PRD-001"
         if pedido.papel == "tech-lead":
             (docs / "spec.md").write_text("spec\n", encoding="utf-8")
@@ -84,7 +87,7 @@ def test_turno_completo_sem_github(projeto):
     resumo, eventos = _rodar(roteiro)
     assert roteiro.chamadas == ["tech-lead", "advisor", "developer", "auditor", "developer", "auditor"]
     wt = projeto / ".firma" / "worktrees" / "PRD-001"
-    log = subprocess.run(["git", "-C", str(wt), "log", "--format=%s"], capture_output=True, text=True).stdout
+    log = subprocess.run(["git", "-C", str(wt), "log", "--format=%s"], capture_output=True, text=True, encoding="utf-8").stdout
     assert "feat(PRD-001): T2 — remover item" in log and "docs(PRD-001): spec e plano" in log
     assert "- [x] T1" in (wt / "docs/firma/PRD-001/plano.md").read_text()
     # sem GitHub configurado não há PR: fica estacionado com o aviso no INBOX
@@ -108,7 +111,13 @@ def test_bloqueio_do_advisor_estaciona(projeto):
     assert prd.ler(projeto / ".firma/backlog/PRD-001-carrinho.md").status == "estacionado"
 
 
+def _sem_fallback(projeto):
+    cfg = projeto / ".firma" / "config.toml"
+    cfg.write_text(cfg.read_text(encoding="utf-8").replace('fallback_provider = "google"', 'fallback_provider = ""'), encoding="utf-8")
+
+
 def test_teto_da_quota_pausa_e_retoma(projeto):
+    _sem_fallback(projeto)
     class Cara(Roteiro):
         async def __call__(self, pedido, quota):
             r = await super().__call__(pedido, quota)
@@ -120,18 +129,18 @@ def test_teto_da_quota_pausa_e_retoma(projeto):
     assert "quota semanal" in resumo["pausa"]
     caminho = projeto / ".firma/backlog/PRD-001-carrinho.md"
     assert prd.ler(caminho).status == "pronto"  # volta para a fila
-    estado = executor.EstadoPrd.carregar(projeto, "PRD-001")
+    estado = EstadoPrd.carregar(projeto, "PRD-001")
     assert estado.fase == "tarefas" and estado.feitas == []
 
     roteiro = Roteiro()
     resumo, _ = _rodar(roteiro)  # retoma: não refaz a spec
     assert roteiro.chamadas[0] == "developer"
-    assert executor.EstadoPrd.carregar(projeto, "PRD-001").feitas == ["T1", "T2"]
+    assert EstadoPrd.carregar(projeto, "PRD-001").feitas == ["T1", "T2"]
 
 
 def test_verificacao_falhando_nao_chama_auditor(projeto):
     cfg = projeto / ".firma" / "config.toml"
-    cfg.write_text(cfg.read_text(encoding="utf-8").replace(TESTE_OK, TESTE_FALHA), encoding="utf-8")
+    cfg.write_text(cfg.read_text(encoding="utf-8").replace(repr(TESTE_OK), repr(TESTE_FALHA)), encoding="utf-8")
     roteiro = Roteiro(advisor_diag="BLOQUEIO: teste quebrado")
     resumo, _ = _rodar(roteiro)
     assert "auditor" not in roteiro.chamadas
@@ -210,7 +219,7 @@ def test_erro_inesperado_estaciona_e_conta(projeto):
 
 
 def test_caminho_curto_e_feed():
-    from firma.sessao import _Feed, caminho_curto
+    from firma.runtime.base import _Feed, caminho_curto
 
     wt = Path("C:/projetos/poc/.firma/worktrees/PRD-001")
     assert caminho_curto("C:\\projetos\\poc\\.firma\\worktrees\\PRD-001\\agent\\app.py", wt) == "agent/app.py"

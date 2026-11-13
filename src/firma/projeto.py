@@ -39,7 +39,16 @@ class Deteccao:
     github: str | None = None  # "dono/repo"
     partes: list[Parte] = field(default_factory=list)
     tem_claude_md: bool = False
+    tem_agents_md: bool = False
+    skills_claude: int = 0  # skills em .claude/skills (o Claude e o OpenCode leem)
+    skills_opencode: int = 0  # skills em .opencode/skills (só o OpenCode lê)
     avisos: list[str] = field(default_factory=list)
+
+
+def _contar_skills(pasta: Path) -> int:
+    if not pasta.is_dir():
+        return 0
+    return sum(1 for p in pasta.iterdir() if (p.is_dir() and (p / "SKILL.md").exists()) or p.suffix == ".md")
 
 
 def _git(raiz: Path, *args: str) -> str | None:
@@ -185,7 +194,15 @@ def detectar(pasta: Path) -> Deteccao | None:
         github=parse_github(_git(raiz, "remote", "get-url", "origin")),
         partes=detectar_partes(raiz),
         tem_claude_md=(raiz / "CLAUDE.md").exists() or (raiz / ".claude" / "CLAUDE.md").exists(),
+        tem_agents_md=(raiz / "AGENTS.md").exists(),
+        skills_claude=_contar_skills(raiz / ".claude" / "skills"),
+        skills_opencode=_contar_skills(raiz / ".opencode" / "skills"),
     )
+    if d.skills_opencode and not d.skills_claude:
+        d.avisos.append(
+            "As skills estão só em .opencode/skills: os papéis no Claude não as enxergam. "
+            "Prefira .claude/skills, que o Claude e o OpenCode leem."
+        )
     if d.github is None:
         d.avisos.append(
             "Sem remoto do GitHub em `origin`: a Firma não vai conseguir abrir PRs. "
@@ -231,7 +248,31 @@ def gerar_config(d: Deteccao) -> str:
         "teto_semanal = 0.6\n"
         '# Janela em que pode rodar, "HH:MM-HH:MM". Vazio = qualquer hora.\n'
         'janela = ""\n'
+        "\n[execucao]\n"
+        "rodadas = 3\n"
+        f"{_modelos_toml()}"
     )
+
+
+def _modelos_toml() -> str:
+    """Um bloco por papel. O Claude roda pela assinatura (Agent SDK); o Gemini pelo OpenCode.
+    Quando a quota do Claude acaba, o papel passa para o fallback até o fim do turno."""
+    from firma.config import FALLBACK_PADRAO
+
+    fp, fm = FALLBACK_PADRAO
+    blocos = [
+        "\n# Modelo de cada papel. provider: anthropic (assinatura Claude) ou google (Gemini via OpenCode).\n"
+        '# model vazio no anthropic = o padrão do Claude Code. Nunca ponha chaves aqui.\n'
+    ]
+    for secao, modelo in (("tech_lead", ""), ("advisor", "opus"), ("developer", ""), ("auditor", "")):
+        blocos.append(
+            f"[modelos.{secao}]\n"
+            'provider = "anthropic"\n'
+            f"model = {_toml_str(modelo)}\n"
+            f"fallback_provider = {_toml_str(fp)}\n"
+            f"fallback_model = {_toml_str(fm)}\n"
+        )
+    return "\n".join(blocos)
 
 
 def garantir_gitignore(raiz: Path) -> bool:

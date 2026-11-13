@@ -80,7 +80,8 @@ def init(
     typer.echo(f"Projeto: {d.nome}  ({d.raiz})")
     typer.echo(f"  branch principal: {d.branch_principal}")
     typer.echo(f"  GitHub:           {d.github or '—'}")
-    typer.echo(f"  CLAUDE.md:        {'sim' if d.tem_claude_md else 'não'}")
+    typer.echo(f"  CLAUDE.md:        {'sim' if d.tem_claude_md else 'não'}   AGENTS.md: {'sim' if d.tem_agents_md else 'não'}")
+    typer.echo(f"  skills:           .claude/skills {d.skills_claude} · .opencode/skills {d.skills_opencode}")
     if not d.partes:
         typer.echo("  partes:           nenhuma reconhecida")
     for p in d.partes:
@@ -275,15 +276,13 @@ def run(
     """Pega os PRDs prontos e leva cada um até um PR em rascunho."""
     from firma import executor
     from firma.eventos import Registro
-    from firma.sessao import rodar as rodar_sdk
+    from firma.runtime.roteador import Roteador
 
     registro = Registro(mostrar=typer.echo)
 
-    async def sessao(pedido, quota):
-        return await rodar_sdk(pedido, registro, quota, detalhe)
-
     async def principal_async():
-        return await executor.rodar_turno(sessao, registro, projeto, max_prds, sem_pr)
+        async with Roteador(registro, detalhe) as sessao:
+            return await executor.rodar_turno(sessao, registro, projeto, max_prds, sem_pr)
 
     try:
         resumo = anyio.run(principal_async)
