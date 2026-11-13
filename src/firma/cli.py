@@ -94,8 +94,10 @@ def _sondar_opencode() -> bool:
         else:
             tudo_ok = False
             typer.echo(f" ✗ {item['provider']}/{item['model']}: {item['erro']}")
-    if not tudo_ok:
-        typer.echo("Para conectar o Gemini: `opencode auth login` e escolha Google (chave do AI Studio).")
+            if item["provider"] not in (resultado.get("conectados") or []):
+                typer.echo(f"   Conecte com `opencode auth login` e escolha {item['provider']} (para o Gemini, chave do AI Studio).")
+            elif item.get("tipo_erro") == "configuracao":
+                typer.echo(f"   Troque o modelo em .firma/config.toml (`opencode models {item['provider']}` lista os disponíveis).")
     return tudo_ok
 
 

@@ -18,7 +18,7 @@ else:  # pragma: no cover
     import tomli as tomllib
 
 PROVEDORES = ("anthropic", "google")
-FALLBACK_PADRAO = ("google", "gemini-2.5-pro")
+FALLBACK_PADRAO = ("google", "gemini-3.1-pro-preview")
 
 PADRAO = {
     "projeto": {"nome": "", "branch_principal": "main", "github": ""},
